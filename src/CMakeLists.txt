@@ -3,6 +3,8 @@ project(agregator-eds-src)
 set(AGGREGATOR_BACKEND ebookbackendaggregator)
 
 set(AGGREGATOR_BACKEND_SRCS
+    e-book-meta-view.c
+    e-book-meta-view.h
     e-book-backend-aggregator.c
     e-book-backend-aggregator-factory.c
     e-book-backend-aggregator.h

@@ -6,6 +6,7 @@
 #include <libebook/libebook.h>
 
 #include "e-book-backend-aggregator.h"
+#include "e-book-meta-view.h"
 
 
 #define E_BOOK_BACKEND_AGGREGATOR_GET_PRIVATE(obj) \
@@ -29,89 +30,18 @@ G_DEFINE_TYPE_WITH_CODE (
 
 struct _EBookBackendAggregatorPrivate {
     GObject *obj;
+    EBookMetaView *meta_view;
 };
 
-static gpointer
-book_backend_aggregator_get_view_thread (EBookClient *client)
-{
-    EBookClientView *view;
-    EBookQuery *query;
-    gchar *sexp;
-    GError *error = NULL;
-
-    query = e_book_query_any_field_contains("");
-    sexp = e_book_query_to_string(query);
-    e_book_query_unref (query);
-    e_book_client_get_view_sync (E_BOOK_CLIENT (client),
-                                 sexp,
-                                 &view,
-                                 NULL,
-                                 &error);
-    if (error) {
-        g_warning ("Fail to get view: [%s]", error->message);
-        g_clear_error (&error);
-    } else {
-        e_book_client_view_start (E_BOOK_CLIENT_VIEW (view), &error);
-        if (error) {
-            g_warning ("Fail to start view: %s", error->message);
-        } else {
-            g_debug ("VIEW STARTED");
-        }
-    }
-    g_free (sexp);
-    return NULL;
-}
-
-static gboolean
-book_backend_aggregator_register_client (EBookBackendAggregator *self,
-                                         EClient *client)
-{
-    g_debug ("book_backend_aggregator_register_client: %d", __LINE__);
-    GThread *thread;
-
-    g_object_ref (client);
-    thread = g_thread_new (NULL,
-                           (GThreadFunc) book_backend_aggregator_get_view_thread,
-                           client);
-
-    g_thread_unref (thread);
-    return TRUE;
-}
-
 static void
-book_backend_aggregator_client_connected_cb (GObject *source_object,
-                                             GAsyncResult *result,
-                                             EBookBackendAggregator *self)
+book_backend_aggregator_add_source (EBookBackendAggregator *self,
+                                    ESourceRegistry *registry,
+                                    ESource *source,
+                                    GCancellable *cancellable,
+                                    GError **error)
 {
-    g_debug (G_STRFUNC);
+    g_debug (__PRETTY_FUNCTION__);
 
-    EClient *client;
-    GError *error = NULL;
-
-    g_return_if_fail (self != NULL);
-
-    client = e_book_client_connect_finish (result, &error);
-
-    /* Sanity check. */
-    g_return_if_fail (
-        ((client != NULL) && (error == NULL)) ||
-        ((client == NULL) && (error != NULL)));
-
-    if (error != NULL) {
-        g_warning ("%s: %s", G_STRFUNC, error->message);
-        g_error_free (error);
-        return;
-    }
-
-    book_backend_aggregator_register_client (self, client);
-    g_object_unref (client);
-}
-
-static void
-book_backend_aggregator_source_added (ESourceRegistry *registry,
-                                      ESource *source,
-                                      EBookBackendAggregator *self)
-{
     ESourceBackend *extension;
     const gchar *extension_name;
 
@@ -139,67 +69,63 @@ book_backend_aggregator_source_added (ESourceRegistry *registry,
         return;
     }
 
-    e_book_client_connect (source,
-                           NULL,
-                           (GAsyncReadyCallback) book_backend_aggregator_client_connected_cb,
-                           self);
+    EClient *client;
+    GError *gError;
+    gError = NULL;
+    client = e_book_client_connect_direct_sync (registry,
+                                                source,
+                                                cancellable,
+                                                &gError);
+    if (gError) {
+        g_warning ("Fail to connect with client: %s:%s", G_STRFUNC, gError->message);
+        if (*error) {
+            *error = gError;
+        }
+        return;
+    }
+
+    g_debug ("Clie connected: %p, %s", client, e_source_get_display_name (source));
+    e_book_meta_view_register_client (self->priv->meta_view, E_BOOK_CLIENT (client));
+    g_object_unref (client);
 }
+
+static void
+book_backend_aggregator_source_added (ESourceRegistry *registry,
+                                      ESource *source,
+                                      EBookBackendAggregator *self)
+{
+    g_debug (__PRETTY_FUNCTION__);
+    book_backend_aggregator_add_source (self, registry, source, NULL, NULL);
+}
+
 
 static void
 book_backend_aggregator_source_removed (ESourceRegistry *registry,
                                         ESource *source,
                                         EBookBackendAggregator *self)
 {
-    // TODO
+    g_warning ("NOT IMPLEMENTED: %s", __PRETTY_FUNCTION__);
     return;
-}
-
-static gboolean
-book_backend_aggregator_load_external_sources (gpointer user_data)
-{
-    EBookBackendAggregator *self;
-    ESourceRegistry *registry;
-    GList *sources;
-    GList *link;
-
-    self = E_BOOK_BACKEND_AGGREGATOR (user_data);
-    registry = e_book_backend_get_registry(E_BOOK_BACKEND (self));
-    sources = e_source_registry_list_sources (registry,
-                                              E_SOURCE_EXTENSION_ADDRESS_BOOK);
-
-    for(link = sources; link != NULL; link = link->next) {
-        book_backend_aggregator_source_added (registry,
-                                              E_SOURCE (link->data),
-                                              self);
-    }
-
-    g_list_free_full (sources, (GDestroyNotify) g_object_unref);
-    return FALSE;
 }
 
 static void
 book_backend_aggregator_dispose (GObject *object)
 {
+    g_debug (__PRETTY_FUNCTION__);
     G_OBJECT_CLASS (e_book_backend_aggregator_parent_class)->dispose (object);
 }
 
 static void
 book_backend_aggregator_finalize (GObject *object)
 {
+    g_debug (__PRETTY_FUNCTION__);
     G_OBJECT_CLASS (e_book_backend_aggregator_parent_class)->finalize (object);
 }
 
 static void
 book_backend_aggregator_constructed (GObject *object)
 {
-    /* Load address book sources from an idle callback
-     * to avoid deadlocking e_data_factory_ref_backend(). */
-    g_idle_add_full(
-        G_PRIORITY_DEFAULT_IDLE,
-        book_backend_aggregator_load_external_sources,
-        g_object_ref (object),
-        (GDestroyNotify) g_object_unref);
-
+    g_debug (__PRETTY_FUNCTION__);
     /* Chain up to parent's constructed() method. */
     G_OBJECT_CLASS (e_book_backend_aggregator_parent_class)->constructed (object);
 }
@@ -208,6 +134,7 @@ static gchar *
 book_backend_aggregator_get_backend_property (EBookBackend *backend,
                                         const gchar *prop_name)
 {
+    g_debug (__PRETTY_FUNCTION__);
     g_return_val_if_fail (prop_name != NULL, NULL);
 
     if (g_str_equal (prop_name, CLIENT_BACKEND_PROPERTY_CAPABILITIES)) {
@@ -238,10 +165,30 @@ book_backend_aggregator_get_backend_property (EBookBackend *backend,
 
 
 static gboolean
-book_backend_aggregator_open_sync (EBookBackend *backend,
-                             GCancellable *cancellable,
-                             GError **error)
+book_backend_aggregator_open_sync (EBookBackend *self,
+                                   GCancellable *cancellable,
+                                   GError **error)
 {
+    g_debug (__PRETTY_FUNCTION__);
+
+    ESourceRegistry *registry;
+    GList *sources;
+    GList *link;
+
+    registry = e_book_backend_get_registry(E_BOOK_BACKEND (self));
+    sources = e_source_registry_list_sources (registry,
+                                              E_SOURCE_EXTENSION_ADDRESS_BOOK);
+
+    for(link = sources; link != NULL; link = link->next) {
+        book_backend_aggregator_add_source (E_BOOK_BACKEND_AGGREGATOR (self),
+                                            registry,
+                                            E_SOURCE (link->data),
+                                            cancellable,
+                                            error);
+    }
+
+    g_list_free_full (sources, (GDestroyNotify) g_object_unref);
+
     return TRUE;
 }
 
@@ -252,6 +199,7 @@ book_backend_aggregator_create_contacts_sync (EBookBackend *backend,
                                         GCancellable *cancellable,
                                         GError **error)
 {
+    g_warning ("NOT IMPLEMENTED: %s", __PRETTY_FUNCTION__);
     return TRUE;
 }
 
@@ -262,6 +210,7 @@ book_backend_aggregator_modify_contacts_sync (EBookBackend *backend,
                                         GCancellable *cancellable,
                                         GError **error)
 {
+    g_warning ("NOT IMPLEMENTED: %s", __PRETTY_FUNCTION__);
     return TRUE;
 }
 
@@ -271,26 +220,29 @@ book_backend_aggregator_remove_contacts_sync (EBookBackend *backend,
                                         GCancellable *cancellable,
                                         GError **error)
 {
+    g_warning ("NOT IMPLEMENTED: %s", __PRETTY_FUNCTION__);
     return TRUE;
 }
 
 
 static EContact *
 book_backend_aggregator_get_contact_sync (EBookBackend *backend,
-                                    const gchar *uid,
-                                    GCancellable *cancellable,
-                                    GError **error)
+                                          const gchar *uid,
+                                          GCancellable *cancellable,
+                                          GError **error)
 {
+    g_warning ("NOT IMPLEMENTED: %s", __PRETTY_FUNCTION__);
     return NULL;
 }
 
 static gboolean
 book_backend_aggregator_get_contact_list_sync (EBookBackend *backend,
-                                         const gchar *query,
-                                         GQueue *out_contacts,
-                                         GCancellable *cancellable,
-                                         GError **error)
+                                               const gchar *query,
+                                               GQueue *out_contacts,
+                                               GCancellable *cancellable,
+                                               GError **error)
 {
+    g_warning ("NOT IMPLEMENTED: %s", __PRETTY_FUNCTION__);
     return FALSE;
 }
 
@@ -300,7 +252,10 @@ book_backend_aggregator_start_view (EBookBackend *backend,
                                     EDataBookView *book_view)
 {
     g_debug ("book_backend_aggregator_start_view\n");
-    e_data_book_view_notify_complete (book_view, NULL /* Success */);
+//    e_data_book_view_notify_complete (book_view, NULL);
+    g_object_ref (book_view);
+    e_book_meta_view_start_view (E_BOOK_BACKEND_AGGREGATOR(backend)->priv->meta_view,
+                                 book_view);
 }
 
 static void
@@ -308,11 +263,14 @@ book_backend_aggregator_stop_view (EBookBackend *backend,
                                    EDataBookView *book_view)
 {
     g_debug ("book_backend_aggregator_stop_view");
+    e_book_meta_view_stop_view (E_BOOK_BACKEND_AGGREGATOR(backend)->priv->meta_view,
+                                book_view);
 }
 
 static void
 book_backend_aggregator_sync (EBookBackend *backend)
 {
+    g_warning ("NOT IMPLEMENTED: %s", __PRETTY_FUNCTION__);
 }
 
 static gboolean
@@ -321,12 +279,14 @@ book_backend_aggregator_set_locale (EBookBackend *backend,
                               GCancellable *cancellable,
                               GError **error)
 {
+    g_warning ("NOT IMPLEMENTED: %s", __PRETTY_FUNCTION__);
     return TRUE;
 }
 
 static gchar *
 book_backend_aggregator_dup_locale (EBookBackend *backend)
 {
+    g_warning ("NOT IMPLEMENTED: %s", __PRETTY_FUNCTION__);
     return NULL;
 }
 
@@ -337,6 +297,7 @@ book_backend_aggregator_create_cursor (EBookBackend *backend,
                                  guint n_fields,
                                  GError **error)
 {
+    g_warning ("NOT IMPLEMENTED: %s", __PRETTY_FUNCTION__);
     return NULL;
 }
 
@@ -345,6 +306,7 @@ book_backend_aggregator_delete_cursor (EBookBackend *backend,
                                  EDataBookCursor *cursor,
                                  GError **error)
 {
+    g_warning ("NOT IMPLEMENTED: %s", __PRETTY_FUNCTION__);
     return TRUE;
 }
 
@@ -353,6 +315,7 @@ book_backend_aggregator_initable_init (GInitable *initable,
                                  GCancellable *cancellable,
                                  GError **error)
 {
+    g_warning ("NOT IMPLEMENTED: %s", __PRETTY_FUNCTION__);
     return TRUE;
 }
 
@@ -400,5 +363,6 @@ static void
 e_book_backend_aggregator_init (EBookBackendAggregator *backend)
 {
     backend->priv = E_BOOK_BACKEND_AGGREGATOR_GET_PRIVATE (backend);
+    backend->priv->meta_view = e_book_meta_view_new ();
 }
 
